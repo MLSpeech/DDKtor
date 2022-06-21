@@ -18,7 +18,8 @@ This is a beta version of DDKtor. Any reports of bugs, comments on how to improv
 
 - Download the code:
     ```
-    git clone https://github.com/YaelSegal/DDKtor
+    git clone [https://github.com/YaelSegal/DDKtor](https://github.com/MLSpeech/DDKtor)
+    
     ```
 - Download Praat from: http://www.fon.hum.uva.nl/praat/ .
 
