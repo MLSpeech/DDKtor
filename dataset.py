@@ -59,6 +59,7 @@ class PredictDataset(data.Dataset):
     def __init__(self, data_path, seed, slices_size=250, overlap=40, normalize=True, norm_type='z'):
         np.random.seed(seed)
         random.seed(seed)
+        torch.manual_seed(seed)
         self.norm_type = norm_type
         self.normalize = normalize
         y, sr = soundfile.read(data_path)
