@@ -7,18 +7,18 @@ PredictDataset.__init__ only resets np.random.seed and random.seed —
 not torch.manual_seed. Since CnnLstmRawSim.init_hidden() calls
 nn.init.uniform_() (which draws from torch's RNG), the LSTM hidden
 state depends on cumulative RNG consumption from all previously
-processed files. Different file orderings → different predictions.
+processed files. Different file orderings -> different predictions.
 """
 
 import os
 import sys
+import tempfile
 import numpy as np
 import random
 from unittest.mock import patch
 import torch
-import torch.nn.functional as F
+import soundfile
 
-# Ensure project root is on sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
@@ -35,10 +35,14 @@ MODEL_PATH = os.path.join(
     "noise_lamda_1.0_59021734.pth",
 )
 DEVICE = "cpu"
+SR = 16000
 
-# Use two different wav files from sarah-data
-SMR_FILE = os.path.join(PROJECT_ROOT, "sarah-data", "4016_02_ddk_alternating_SEPT.wav")
-AMR_FILE = os.path.join(PROJECT_ROOT, "sarah-data", "4016_02_ddk_repetition_SEPT.wav")
+
+def _make_wav(path, duration_sec, rng_seed):
+    """Generate a synthetic wav file at 16kHz."""
+    rng = np.random.RandomState(rng_seed)
+    samples = rng.randn(int(SR * duration_sec)).astype(np.float32) * 0.1
+    soundfile.write(path, samples, SR)
 
 
 def _run_prediction(model, wav_path, seed, normalize, norm_type):
@@ -73,71 +77,77 @@ def test_order_dependent_predictions_before_fix():
     We patch torch.manual_seed to a no-op inside PredictDataset.__init__
     to simulate the old code that was missing that call.
     """
-
     model, normalize, sigmoid, norm_type = load_model(MODEL_PATH)
     model.to(DEVICE)
     model.eval()
 
-    # Patch torch.manual_seed so dataset.__init__ can't reset it,
-    # simulating the pre-fix behavior.
-    with patch("dataset.torch.manual_seed"):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        file_a = os.path.join(tmpdir, "a.wav")
+        file_b = os.path.join(tmpdir, "b.wav")
+        _make_wav(file_a, duration_sec=1.0, rng_seed=42)
+        _make_wav(file_b, duration_sec=0.5, rng_seed=99)
+
+        with patch("dataset.torch.manual_seed"):
+            with torch.no_grad():
+                # Run A: target file only
+                torch.manual_seed(SEED)
+                np.random.seed(SEED)
+                random.seed(SEED)
+                logits_a = _run_prediction(
+                    model, file_a, SEED, normalize, norm_type,
+                )
+
+                # Run B: dummy file first, then target file
+                torch.manual_seed(SEED)
+                np.random.seed(SEED)
+                random.seed(SEED)
+                _run_prediction(
+                    model, file_b, SEED, normalize, norm_type,
+                )
+                logits_b = _run_prediction(
+                    model, file_a, SEED, normalize, norm_type,
+                )
+
+        assert not torch.allclose(logits_a, logits_b, atol=1e-7), (
+            "Expected logits to DIFFER when torch RNG is not reset per-file, "
+            "but they were identical. Bug may already be fixed or test setup is wrong."
+        )
+
+
+def test_order_independent_predictions_after_fix():
+    """Proves the fix: the real dataset.py now resets torch.manual_seed
+    per-file, so logits are identical regardless of processing order."""
+    model, normalize, sigmoid, norm_type = load_model(MODEL_PATH)
+    model.to(DEVICE)
+    model.eval()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        file_a = os.path.join(tmpdir, "a.wav")
+        file_b = os.path.join(tmpdir, "b.wav")
+        _make_wav(file_a, duration_sec=1.0, rng_seed=42)
+        _make_wav(file_b, duration_sec=0.5, rng_seed=99)
+
         with torch.no_grad():
             # Run A: target file only
             torch.manual_seed(SEED)
             np.random.seed(SEED)
             random.seed(SEED)
             logits_a = _run_prediction(
-                model, SMR_FILE, SEED, normalize, norm_type,
+                model, file_a, SEED, normalize, norm_type,
             )
 
-            # Run B: dummy file first, then target file
+            # Run B: dummy file first, then target
             torch.manual_seed(SEED)
             np.random.seed(SEED)
             random.seed(SEED)
             _run_prediction(
-                model, AMR_FILE, SEED, normalize, norm_type,
+                model, file_b, SEED, normalize, norm_type,
             )
             logits_b = _run_prediction(
-                model, SMR_FILE, SEED, normalize, norm_type,
+                model, file_a, SEED, normalize, norm_type,
             )
 
-    # Logits should differ — proving the bug
-    assert not torch.allclose(logits_a, logits_b, atol=1e-7), (
-        "Expected logits to DIFFER when torch RNG is not reset per-file, "
-        "but they were identical. Bug may already be fixed or test setup is wrong."
-    )
-
-
-def test_order_independent_predictions_after_fix():
-    """Proves the fix: the real dataset.py now resets torch.manual_seed
-    per-file, so logits are identical regardless of processing order."""
-
-    model, normalize, sigmoid, norm_type = load_model(MODEL_PATH)
-    model.to(DEVICE)
-    model.eval()
-
-    with torch.no_grad():
-        # Run A: target file only
-        torch.manual_seed(SEED)
-        np.random.seed(SEED)
-        random.seed(SEED)
-        logits_a = _run_prediction(
-            model, SMR_FILE, SEED, normalize, norm_type,
+        assert torch.allclose(logits_a, logits_b, atol=1e-7), (
+            "Expected logits to be IDENTICAL when torch RNG is reset per-file, "
+            f"but max diff was {(logits_a - logits_b).abs().max().item():.2e}."
         )
-
-        # Run B: dummy file first, then target
-        torch.manual_seed(SEED)
-        np.random.seed(SEED)
-        random.seed(SEED)
-        _run_prediction(
-            model, AMR_FILE, SEED, normalize, norm_type,
-        )
-        logits_b = _run_prediction(
-            model, SMR_FILE, SEED, normalize, norm_type,
-        )
-
-    # Logits should be identical — proving the fix works
-    assert torch.allclose(logits_a, logits_b, atol=1e-7), (
-        "Expected logits to be IDENTICAL when torch RNG is reset per-file, "
-        f"but max diff was {(logits_a - logits_b).abs().max().item():.2e}."
-    )
